@@ -13,14 +13,17 @@ mod context;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
-
+pub use crate::syscall;
 use crate::config::MAX_APP_NUM;
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
-
+pub use syscall::TaskInfo;
+pub use syscall::TimeVal;
+use crate::timer::*;
 pub use context::TaskContext;
 
 /// The task manager, where all the tasks are managed.
@@ -34,17 +37,19 @@ pub use context::TaskContext;
 /// existing functions on `TaskManager`.
 pub struct TaskManager {
     /// total number of tasks
-    num_app: usize,
+    pub num_app: usize,
     /// use inner value to get mutable access
-    inner: UPSafeCell<TaskManagerInner>,
+    pub inner: UPSafeCell<TaskManagerInner>,
 }
 
 /// Inner of Task Manager
 pub struct TaskManagerInner {
     /// task list
-    tasks: [TaskControlBlock; MAX_APP_NUM],
+    pub tasks: [TaskControlBlock; MAX_APP_NUM],
+    /// TaskInfo list
+    pub task_infos: [TaskInfo; MAX_APP_NUM],
     /// id of current `Running` task
-    current_task: usize,
+    pub current_task: usize,
 }
 
 lazy_static! {
@@ -59,11 +64,19 @@ lazy_static! {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
         }
+        // 对 task_infos 进行初始化
+        let task_infos = [TaskInfo{
+            status: TaskStatus::UnInit,
+            syscall_times:[0; MAX_SYSCALL_NUM],
+            time: 0,
+        }; MAX_APP_NUM];
+
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
+                    task_infos,
                     current_task: 0,
                 })
             },
@@ -78,9 +91,13 @@ impl TaskManager {
     /// But in ch3, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
-        let task0 = &mut inner.tasks[0];
-        task0.task_status = TaskStatus::Running;
-        let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+        // 取出第一个 taskinfos 
+        inner.tasks[0].task_status = TaskStatus::Running;
+        // 将 taskinfos 的 status 修改为 Running
+        inner.task_infos[0].status = TaskStatus::Running;
+        // 记录下 taskinfo0 被调用的时间
+        inner.task_infos[0].time = get_time_us();
+        let next_task_cx_ptr = &inner.tasks[0].task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -99,7 +116,7 @@ impl TaskManager {
 
     /// Change the status of current `Running` task into `Exited`.
     fn mark_current_exited(&self) {
-        let mut inner = self.inner.exclusive_access();
+        let mut inner: core::cell::RefMut<TaskManagerInner> = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
     }
@@ -120,8 +137,14 @@ impl TaskManager {
     fn run_next_task(&self) {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
+            //let mut inners = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            inner.task_infos[next].status = TaskStatus::Running;
+            // 如果 task 的 time 字段为 0 ，则是第一次被调度，记录下调用时间
+            if inner.task_infos[next].time == 0{
+                inner.task_infos[next].time = get_time_us();
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -135,6 +158,34 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// 记录当前系统调用的类型及次数
+    pub fn record_current_syscall(&self, sys_id: usize){
+    // 获取当前 task
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.task_infos[current].syscall_times[sys_id] += 1;
+        drop(inner);
+    }
+
+    /// 记录当前系统调用距离 task 第一次被调用的 TimeVal
+    pub fn get_time_val(&self){
+        // 获取现在时间
+        let current_time = get_time_us();
+        // 获取当前 task 
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        // 获取时间差
+        let time = current_time - inner.task_infos[current].time;
+        let time_val = TimeVal{
+            sec: time / 1_000_000,
+            usec: time % 1_000_000,
+        };
+        inner.task_infos[current].time = ((time_val.sec & 0xffff) * 1000 + time_val.usec / 1000) as usize;
+        drop(inner);
+    }
+    
+
 }
 
 /// Run the first task in task list.
